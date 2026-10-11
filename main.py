@@ -1,406 +1,291 @@
 """
-Heatwave Early Warning System
-------------------------------
-Python concepts used:
-  - tkinter + ttk       GUI widgets, layout managers, event handling
-  - sqlite3             persistent database (INSERT, SELECT, DELETE)
-  - threading           background demo loop (non-blocking UI)
-  - matplotlib (TkAgg)  chart embedded inside a Tkinter window
-  - re / math           serial-line parsing and heat-index formula
-  - OOP                 HeatwaveApp class, HeatwaveDB class
+Heatwave Data Management Dashboard
+------------------------------------
+Python concepts demonstrated:
+  tkinter + ttk  — GUI (Entry, Button, Combobox, Treeview, messagebox)
+  sqlite3        — CRUD database (INSERT, SELECT, UPDATE, DELETE)
+  OOP            — HeatwaveDashboard class, HeatwaveDB class
+  Exception handling, StringVar, trace, column sorting
 """
 
-import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading
-from datetime import datetime
-
-import matplotlib
-matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkinter import ttk, messagebox
+from datetime import date
 
 from database import HeatwaveDB
-from heatwave.analytics import heat_index, linear_trend
-from heatwave.alerts import get_level, COLORS, ADVICE
-from heatwave.ingest import demo_reading, parse_text, SCENARIO_NAMES
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Colour palette
+# ── Palette ───────────────────────────────────────────────────────────────────
 BG      = "#1a1a2e"
-SIDEBAR = "#16213e"
+PANEL   = "#16213e"
 TILE    = "#0f3460"
 WHITE   = "#ffffff"
 GRAY    = "#aaaaaa"
 ACCENT  = "#e94560"
 
+ALERT_COLORS = {
+    "NORMAL":           "#2ecc71",
+    "WARNING":          "#f1c40f",
+    "HEAT WAVE":        "#e67e22",
+    "SEVERE HEAT WAVE": "#e74c3c",
+}
 
-class HeatwaveApp(tk.Tk):
+
+def get_alert_level(temp):
+    """Return IMD alert level for a given temperature (°C)."""
+    if temp >= 47:
+        return "SEVERE HEAT WAVE"
+    if temp >= 45 or temp >= 40:
+        return "HEAT WAVE"
+    if temp >= 37:
+        return "WARNING"
+    return "NORMAL"
+
+
+class HeatwaveDashboard(tk.Tk):
+
     def __init__(self):
         super().__init__()
-        self.title("Heatwave Early Warning System")
-        self.geometry("1150x720")
-        self.minsize(900, 600)
+        self.title("Heatwave Data Management Dashboard")
+        self.geometry("1100x660")
+        self.minsize(900, 560)
         self.configure(bg=BG)
 
-        # State
-        self.db      = HeatwaveDB(os.path.join(SCRIPT_DIR, "heatwave.db"))
-        self._step   = 0
-        self._stop   = threading.Event()
-        self._thread = None
-        self._running = False
-
-        # Tkinter variables (linked to widgets)
-        self.source_var   = tk.StringVar(value="demo")
-        self.scenario_var = tk.StringVar(value=SCENARIO_NAMES[0])
-        self.station_var  = tk.StringVar(value="Plains")
+        self.db         = HeatwaveDB()
+        self._edit_id   = None   # tracks which row is being edited
 
         self._build_ui()
-        self._refresh()
+        self._load_records()
 
     # ── Build UI ──────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        self._build_sidebar()
-        self._build_main()
+        self._build_header()
+        self._build_stats_bar()
 
-    def _build_sidebar(self):
-        sb = tk.Frame(self, bg=SIDEBAR, width=230)
-        sb.pack(side="left", fill="y")
-        sb.pack_propagate(False)
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=12, pady=10)
 
-        tk.Label(sb, text="⚙  Settings", font=("Arial", 13, "bold"),
-                 bg=SIDEBAR, fg=WHITE).pack(pady=(20, 12))
+        self._build_form(body)
+        self._build_table(body)
 
-        # Data source radio buttons
-        tk.Label(sb, text="Data Source", font=("Arial", 9),
-                 bg=SIDEBAR, fg=GRAY).pack(anchor="w", padx=15)
-        for val, txt in [("demo", "Demo Simulator"), ("tinkercad", "Tinkercad Log")]:
-            ttk.Radiobutton(sb, text=txt, variable=self.source_var, value=val,
-                            command=self._on_source_change).pack(anchor="w", padx=24, pady=2)
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=ACCENT)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="Heatwave Data Management Dashboard",
+                 font=("Arial", 15, "bold"), bg=ACCENT, fg=WHITE).pack(
+            side="left", padx=20, pady=12)
 
-        # Scenario dropdown (Combobox)
-        tk.Frame(sb, bg=SIDEBAR, height=10).pack()
-        tk.Label(sb, text="Scenario", font=("Arial", 9),
-                 bg=SIDEBAR, fg=GRAY).pack(anchor="w", padx=15)
-        ttk.Combobox(sb, textvariable=self.scenario_var,
-                     values=SCENARIO_NAMES, state="readonly", width=22).pack(padx=15)
+    def _build_stats_bar(self):
+        bar = tk.Frame(self, bg=TILE)
+        bar.pack(fill="x")
 
-        # Station type dropdown
-        tk.Frame(sb, bg=SIDEBAR, height=10).pack()
-        tk.Label(sb, text="Station Type", font=("Arial", 9),
-                 bg=SIDEBAR, fg=GRAY).pack(anchor="w", padx=15)
-        ttk.Combobox(sb, textvariable=self.station_var,
-                     values=["Plains", "Coastal", "Hilly"],
-                     state="readonly", width=22).pack(padx=15)
+        self._v_total  = tk.StringVar(value="Total Records: 0")
+        self._v_avg    = tk.StringVar(value="Avg Temp: —")
+        self._v_max    = tk.StringVar(value="Max Temp: —")
+        self._v_events = tk.StringVar(value="Heat Wave Events: 0")
 
-        # Start / Stop button
-        tk.Frame(sb, bg=SIDEBAR, height=18).pack()
-        self._start_btn = tk.Button(
-            sb, text="▶  Start Demo", font=("Arial", 11, "bold"),
-            bg=ACCENT, fg=WHITE, relief="flat", cursor="hand2",
-            command=self._toggle_demo,
-        )
-        self._start_btn.pack(padx=15, fill="x", ipady=5)
+        for var in (self._v_total, self._v_avg, self._v_max, self._v_events):
+            tk.Label(bar, textvariable=var, font=("Arial", 10, "bold"),
+                     bg=TILE, fg=WHITE).pack(side="left", padx=24, pady=7)
 
-        # Clear database button
-        tk.Frame(sb, bg=SIDEBAR, height=8).pack()
-        tk.Button(sb, text="🗑  Clear Database", font=("Arial", 10),
-                  bg="#2d2d2d", fg=WHITE, relief="flat",
-                  cursor="hand2", command=self._clear_data).pack(padx=15, fill="x", ipady=3)
+    # ── Add / Edit form ───────────────────────────────────────────────────────
 
-        # Reading count label
-        tk.Frame(sb, bg=SIDEBAR, height=20).pack()
-        self._count_var = tk.StringVar(value="Readings saved: 0")
-        tk.Label(sb, textvariable=self._count_var, font=("Arial", 9),
-                 bg=SIDEBAR, fg=GRAY).pack()
+    def _build_form(self, parent):
+        frame = tk.Frame(parent, bg=PANEL, width=270)
+        frame.pack(side="left", fill="y", padx=(0, 12))
+        frame.pack_propagate(False)
 
-    def _build_main(self):
-        main = tk.Frame(self, bg=BG)
-        main.pack(side="left", fill="both", expand=True, padx=12, pady=10)
+        self._form_title = tk.StringVar(value="Add New Record")
+        tk.Label(frame, textvariable=self._form_title, font=("Arial", 12, "bold"),
+                 bg=PANEL, fg=WHITE).pack(pady=(18, 14))
 
-        tk.Label(main, text="Heatwave Monitoring, Prediction and Early Warning",
-                 font=("Arial", 15, "bold"), bg=BG, fg=WHITE).pack(anchor="w")
-        tk.Label(main, text="Tkinter · SQLite · Arduino/Tinkercad — Python mini project",
-                 font=("Arial", 9), bg=BG, fg=GRAY).pack(anchor="w", pady=(0, 8))
-
-        self._build_tiles(main)
-
-        # Tabbed notebook
-        nb = ttk.Notebook(main)
-        nb.pack(fill="both", expand=True, pady=(8, 0))
-        self._build_chart_tab(nb)
-        self._build_table_tab(nb)
-        self._build_tinkercad_tab(nb)
-
-        self._build_alert_log(main)
-
-    def _build_tiles(self, parent):
-        """Four metric tiles: Temperature, Humidity, Heat Index, Alert Level."""
-        row = tk.Frame(parent, bg=BG)
-        row.pack(fill="x")
-
-        specs = [
-            ("Temperature", "temp_val",  "—  °C"),
-            ("Humidity",    "hum_val",   "—  %"),
-            ("Heat Index",  "hi_val",    "—  °C"),
-            ("Alert Level", "alert_val", "——"),
-        ]
-        for col, (title, attr, default) in enumerate(specs):
-            tile = tk.Frame(row, bg=TILE)
-            tile.grid(row=0, column=col, padx=4, sticky="nsew")
-            row.columnconfigure(col, weight=1)
-            tk.Label(tile, text=title, font=("Arial", 9), bg=TILE, fg=GRAY).pack(pady=(8, 0))
-            var = tk.StringVar(value=default)
+        # Input fields
+        for label, attr in [
+            ("City",              "v_city"),
+            ("Date (YYYY-MM-DD)", "v_date"),
+            ("Temperature (°C)",  "v_temp"),
+            ("Humidity (%)",      "v_hum"),
+        ]:
+            tk.Label(frame, text=label, font=("Arial", 9),
+                     bg=PANEL, fg=GRAY).pack(anchor="w", padx=16)
+            var = tk.StringVar()
             setattr(self, attr, var)
-            lbl = tk.Label(tile, textvariable=var, font=("Arial", 20, "bold"),
-                           bg=TILE, fg=WHITE)
-            lbl.pack(pady=(2, 8))
-            if title == "Alert Level":
-                self._alert_lbl = lbl
+            tk.Entry(frame, textvariable=var, font=("Arial", 11),
+                     bg="#0d0d1a", fg=WHITE, insertbackground=WHITE,
+                     relief="flat").pack(fill="x", padx=16, pady=(2, 9), ipady=5)
 
-    def _build_chart_tab(self, nb):
-        """Matplotlib chart embedded inside a Tkinter Frame."""
-        frame = tk.Frame(nb, bg=BG)
-        nb.add(frame, text="  Chart  ")
+        self.v_date.set(str(date.today()))
 
-        self._fig = Figure(figsize=(6, 3), dpi=96, facecolor=BG)
-        self._ax  = self._fig.add_subplot(111)
-        self._ax.set_facecolor("#0d0d1a")
-        self._fig.tight_layout(pad=1.5)
+        # Alert level preview (auto-calculated)
+        tk.Label(frame, text="Alert Level (auto)", font=("Arial", 9),
+                 bg=PANEL, fg=GRAY).pack(anchor="w", padx=16)
+        self._alert_lbl = tk.Label(frame, text="—", font=("Arial", 11, "bold"),
+                                    bg="#0d0d1a", fg=WHITE, anchor="w")
+        self._alert_lbl.pack(fill="x", padx=16, pady=(2, 14), ipady=5)
+        self.v_temp.trace_add("write", self._preview_alert)
 
-        self._canvas = FigureCanvasTkAgg(self._fig, master=frame)
-        self._canvas.get_tk_widget().pack(fill="both", expand=True)
+        # Submit button
+        self._submit_btn = tk.Button(
+            frame, text="+ Add Record", font=("Arial", 11, "bold"),
+            bg=ACCENT, fg=WHITE, relief="flat", cursor="hand2",
+            command=self._submit,
+        )
+        self._submit_btn.pack(fill="x", padx=16, ipady=6)
 
-    def _build_table_tab(self, nb):
-        """Treeview showing rows from SQLite database."""
-        frame = tk.Frame(nb, bg=BG)
-        nb.add(frame, text="  SQLite Data  ")
+        tk.Frame(frame, bg=PANEL, height=6).pack()
+        tk.Button(frame, text="Clear / Cancel", font=("Arial", 10),
+                  bg="#2d2d2d", fg=WHITE, relief="flat", cursor="hand2",
+                  command=self._clear_form).pack(fill="x", padx=16, ipady=4)
 
-        cols = ("Timestamp", "Temp (°C)", "Humidity (%)", "Heat Index (°C)", "Alert")
-        self._tree = ttk.Treeview(frame, columns=cols, show="headings", height=12)
-        for c in cols:
-            self._tree.heading(c, text=c)
-            self._tree.column(c, width=140, anchor="center")
+    # ── Records table ─────────────────────────────────────────────────────────
+
+    def _build_table(self, parent):
+        frame = tk.Frame(parent, bg=BG)
+        frame.pack(side="left", fill="both", expand=True)
+
+        # Search bar + delete button
+        top = tk.Frame(frame, bg=BG)
+        top.pack(fill="x", pady=(0, 8))
+
+        tk.Label(top, text="Search:", font=("Arial", 10),
+                 bg=BG, fg=GRAY).pack(side="left")
+        self._v_search = tk.StringVar()
+        self._v_search.trace_add("write", lambda *_: self._load_records())
+        tk.Entry(top, textvariable=self._v_search, font=("Arial", 10),
+                 bg="#0d0d1a", fg=WHITE, insertbackground=WHITE,
+                 relief="flat", width=28).pack(side="left", padx=(6, 0), ipady=4)
+
+        tk.Button(top, text="Delete Selected", font=("Arial", 10),
+                  bg="#c0392b", fg=WHITE, relief="flat", cursor="hand2",
+                  command=self._delete_record).pack(side="right")
+        tk.Button(top, text="Edit Selected", font=("Arial", 10),
+                  bg="#2980b9", fg=WHITE, relief="flat", cursor="hand2",
+                  command=self._load_into_form).pack(side="right", padx=(0, 6))
+
+        # Treeview
+        cols = ("ID", "City", "Date", "Temp (°C)", "Humidity (%)", "Alert Level")
+        self._tree = ttk.Treeview(frame, columns=cols, show="headings", height=22)
+
+        for col, w in zip(cols, (45, 150, 110, 90, 100, 160)):
+            self._tree.heading(col, text=col,
+                               command=lambda c=col: self._sort_by(c))
+            self._tree.column(col, width=w, anchor="center")
 
         vsb = ttk.Scrollbar(frame, orient="vertical", command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
         self._tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
 
-        tk.Button(frame, text="Refresh Table", font=("Arial", 9),
-                  bg="#2d2d2d", fg=WHITE, relief="flat",
-                  command=self._refresh_table).pack(side="bottom", pady=4)
+        # Colour-code rows by alert level
+        for level, color in ALERT_COLORS.items():
+            self._tree.tag_configure(level, foreground=color)
 
-    def _build_tinkercad_tab(self, nb):
-        """Paste / load a Tinkercad Serial Monitor log and import it."""
-        frame = tk.Frame(nb, bg=BG)
-        nb.add(frame, text="  Tinkercad Log  ")
+    # ── Logic ─────────────────────────────────────────────────────────────────
 
-        tk.Label(frame, text="Paste Tinkercad Serial Monitor output, or load a file:",
-                 bg=BG, fg=GRAY, font=("Arial", 9)).pack(anchor="w", padx=8, pady=(8, 2))
-
-        btn_row = tk.Frame(frame, bg=BG)
-        btn_row.pack(fill="x", padx=8)
-        for text, cmd in [("Load File",    self._load_file),
-                           ("Load Sample",  self._load_sample),
-                           ("✔ Import",     self._import_log)]:
-            bg = ACCENT if "Import" in text else "#2d2d2d"
-            tk.Button(btn_row, text=text, font=("Arial", 9), bg=bg, fg=WHITE,
-                      relief="flat", cursor="hand2", command=cmd).pack(side="left", padx=(0, 6))
-
-        self._log_text = scrolledtext.ScrolledText(
-            frame, bg="#0d0d1a", fg=WHITE,
-            font=("Courier", 9), insertbackground=WHITE, height=12,
-        )
-        self._log_text.pack(fill="both", expand=True, padx=8, pady=6)
-
-        self._import_status = tk.StringVar(value="")
-        tk.Label(frame, textvariable=self._import_status,
-                 bg=BG, fg="#2ecc71", font=("Arial", 9)).pack(anchor="w", padx=8)
-
-    def _build_alert_log(self, parent):
-        frame = tk.Frame(parent, bg=SIDEBAR)
-        frame.pack(fill="x", pady=(8, 0))
-        tk.Label(frame, text="Alert Log", font=("Arial", 9),
-                 bg=SIDEBAR, fg=GRAY).pack(anchor="w", padx=8)
-        self._alert_log = scrolledtext.ScrolledText(
-            frame, height=4, bg="#0d0d1a", fg=WHITE,
-            font=("Courier", 9), state="disabled",
-        )
-        self._alert_log.pack(fill="x", padx=6, pady=(0, 6))
-
-    # ── Demo control ──────────────────────────────────────────────────────────
-
-    def _on_source_change(self):
-        if self.source_var.get() == "tinkercad" and self._running:
-            self._stop_demo()
-
-    def _toggle_demo(self):
-        if self._running:
-            self._stop_demo()
-        else:
-            self._start_demo()
-
-    def _start_demo(self):
-        self._step = 0
-        self._stop.clear()
-        self._running = True
-        self._start_btn.config(text="⏹  Stop Demo", bg="#555555")
-        self._thread = threading.Thread(target=self._demo_loop, daemon=True)
-        self._thread.start()
-
-    def _stop_demo(self):
-        self._stop.set()
-        self._running = False
-        self._start_btn.config(text="▶  Start Demo", bg=ACCENT)
-
-    def _demo_loop(self):
-        """Runs in a background thread; generates one reading every 2 seconds."""
-        while not self._stop.is_set():
-            temp, hum = demo_reading(self.scenario_var.get(), self._step)
-            self._save_reading(temp, hum)
-            self._step += 1
-            self._stop.wait(2)   # wait 2 s between readings
-
-    # ── Data layer ────────────────────────────────────────────────────────────
-
-    def _save_reading(self, temp, hum):
-        hi    = heat_index(temp, hum)
-        level = get_level(temp, self.station_var.get())
-        self.db.insert(temp, hum, hi, level)
-        # Schedule UI updates on the main thread (thread-safe)
-        self.after(0, self._refresh)
-        self.after(0, self._log_entry, temp, hum, hi, level)
-
-    # ── UI refresh ────────────────────────────────────────────────────────────
-
-    def _refresh(self):
-        rows = self.db.fetch_recent(100)
-        if not rows:
-            return
-        _, temp, hum, hi, level = rows[-1]
-
-        self.temp_val.set(f"{temp}  °C")
-        self.hum_val.set(f"{hum}  %")
-        self.hi_val.set(f"{hi}  °C")
-        self.alert_val.set(level)
-        self._alert_lbl.config(fg=COLORS.get(level, WHITE))
-        self._count_var.set(f"Readings saved: {self.db.count()}")
-
-        self._refresh_chart(rows)
-        self._refresh_table(rows)
-
-    def _refresh_chart(self, rows=None):
-        if rows is None:
-            rows = self.db.fetch_recent(100)
-        ax = self._ax
-        ax.clear()
-        ax.set_facecolor("#0d0d1a")
-
-        if rows:
-            temps  = [r[1] for r in rows]
-            his    = [r[3] for r in rows]
-            labels = [r[0][-8:] for r in rows]    # last 8 chars = HH:MM:SS
-            xs     = list(range(len(rows)))
-
-            ax.plot(xs, temps, color="#3498db", linewidth=1.5, label="Temp (°C)")
-            ax.plot(xs, his,   color="#e74c3c", linewidth=1.5, label="Heat Index (°C)")
-
-            # Show trend extrapolation as a dashed line
-            if len(temps) >= 5:
-                trend = linear_trend(temps, 5)
-                tx    = list(range(len(temps), len(temps) + 5))
-                ax.plot(tx, trend, color="#3498db", linewidth=1,
-                        linestyle="--", alpha=0.6, label="Trend")
-
-            step = max(1, len(xs) // 8)
-            ax.set_xticks(xs[::step])
-            ax.set_xticklabels(labels[::step], rotation=30, fontsize=7, color=GRAY)
-            ax.tick_params(colors=GRAY)
-            for spine in ax.spines.values():
-                spine.set_color("#333333")
-            ax.legend(fontsize=8, facecolor=BG, edgecolor="#333", labelcolor=WHITE)
-
-        ax.set_ylabel("°C", color=GRAY, fontsize=9)
-        self._fig.tight_layout(pad=1.2)
-        self._canvas.draw_idle()
-
-    def _refresh_table(self, rows=None):
-        """Reload the Treeview from SQLite data."""
-        if rows is None:
-            rows = self.db.fetch_recent(100)
-        self._tree.delete(*self._tree.get_children())
-        for row in reversed(rows[-50:]):   # newest first
-            self._tree.insert("", "end", values=row)
-
-    def _log_entry(self, temp, hum, hi, level):
-        ts  = datetime.now().strftime("%H:%M:%S")
-        msg = f"[{ts}]  T={temp}°C  H={hum}%  HI={hi}°C  →  {level}\n"
-        self._alert_log.config(state="normal")
-        self._alert_log.insert("end", msg)
-        self._alert_log.see("end")
-        self._alert_log.config(state="disabled")
-
-    # ── Tinkercad log import ──────────────────────────────────────────────────
-
-    def _import_log(self):
-        text     = self._log_text.get("1.0", "end")
-        readings = parse_text(text)
-        if not readings:
-            messagebox.showwarning(
-                "No readings found",
-                "No valid lines found.\nExpected format:  millis,temperature,humidity",
-            )
-            return
-        for temp, hum in readings:
-            hi    = heat_index(temp, hum)
-            level = get_level(temp, self.station_var.get())
-            self.db.insert(temp, hum, hi, level)
-        self._import_status.set(f"✔  Imported {len(readings)} readings.")
-        self._refresh()
-
-    def _load_file(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
-        if path:
-            try:
-                with open(path, "r") as f:
-                    self._log_text.delete("1.0", "end")
-                    self._log_text.insert("end", f.read())
-            except OSError as e:
-                messagebox.showerror("Error", str(e))
-
-    def _load_sample(self):
-        sample = os.path.join(SCRIPT_DIR, "sample_serial_log.txt")
+    def _preview_alert(self, *_):
         try:
-            with open(sample, "r") as f:
-                self._log_text.delete("1.0", "end")
-                self._log_text.insert("end", f.read())
-        except FileNotFoundError:
-            messagebox.showwarning("Not found", "sample_serial_log.txt not found.")
+            level = get_alert_level(float(self.v_temp.get()))
+            self._alert_lbl.config(text=level, fg=ALERT_COLORS.get(level, WHITE))
+        except ValueError:
+            self._alert_lbl.config(text="—", fg=WHITE)
 
-    # ── Clear data ────────────────────────────────────────────────────────────
+    def _submit(self):
+        city = self.v_city.get().strip()
+        date_str = self.v_date.get().strip()
 
-    def _clear_data(self):
-        if messagebox.askyesno("Clear Database", "Delete all readings from the SQLite database?"):
-            self.db.clear()
-            self._tree.delete(*self._tree.get_children())
-            self._alert_log.config(state="normal")
-            self._alert_log.delete("1.0", "end")
-            self._alert_log.config(state="disabled")
-            for attr, default in [("temp_val", "—  °C"), ("hum_val", "—  %"),
-                                   ("hi_val",   "—  °C"), ("alert_val", "——")]:
-                getattr(self, attr).set(default)
-            self._alert_lbl.config(fg=WHITE)
-            self._count_var.set("Readings saved: 0")
-            self._refresh_chart([])
-            self._import_status.set("")
+        try:
+            temp = float(self.v_temp.get())
+            hum  = float(self.v_hum.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Temperature and Humidity must be numbers.")
+            return
+
+        if not city or not date_str:
+            messagebox.showerror("Missing Fields", "City and Date cannot be empty.")
+            return
+
+        if not (0 <= hum <= 100):
+            messagebox.showerror("Invalid Input", "Humidity must be between 0 and 100.")
+            return
+
+        alert = get_alert_level(temp)
+
+        if self._edit_id:
+            self.db.update(self._edit_id, city, date_str, temp, hum, alert)
+            self._edit_id = None
+        else:
+            self.db.insert(city, date_str, temp, hum, alert)
+
+        self._clear_form()
+        self._load_records()
+
+    def _load_into_form(self):
+        """Fill the form with the selected row for editing."""
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a record to edit.")
+            return
+        vals = self._tree.item(sel[0])["values"]
+        self._edit_id = vals[0]
+        self.v_city.set(vals[1])
+        self.v_date.set(vals[2])
+        self.v_temp.set(vals[3])
+        self.v_hum.set(vals[4])
+        self._form_title.set("Edit Record")
+        self._submit_btn.config(text="✔ Save Changes", bg="#2980b9")
+
+    def _delete_record(self):
+        sel = self._tree.selection()
+        if not sel:
+            messagebox.showinfo("No selection", "Select a record to delete.")
+            return
+        if messagebox.askyesno("Confirm Delete", "Delete the selected record?"):
+            record_id = self._tree.item(sel[0])["values"][0]
+            self.db.delete(record_id)
+            self._load_records()
+
+    def _load_records(self, *_):
+        q    = self._v_search.get().strip() if hasattr(self, "_v_search") else ""
+        rows = self.db.search(q) if q else self.db.fetch_all()
+        self._tree.delete(*self._tree.get_children())
+        for row in rows:
+            self._tree.insert("", "end", values=row, tags=(row[5],))
+        self._update_stats()
+
+    def _update_stats(self):
+        s = self.db.get_stats()
+        if s and s[0]:
+            self._v_total.set(f"Total Records: {s[0]}")
+            self._v_avg.set(f"Avg Temp: {s[1]} °C")
+            self._v_max.set(f"Max Temp: {s[2]} °C")
+            self._v_events.set(f"Heat Wave Events: {s[3]}")
+        else:
+            self._v_total.set("Total Records: 0")
+            self._v_avg.set("Avg Temp: —")
+            self._v_max.set("Max Temp: —")
+            self._v_events.set("Heat Wave Events: 0")
+
+    def _clear_form(self):
+        self._edit_id = None
+        self.v_city.set("")
+        self.v_date.set(str(date.today()))
+        self.v_temp.set("")
+        self.v_hum.set("")
+        self._alert_lbl.config(text="—", fg=WHITE)
+        self._form_title.set("Add New Record")
+        self._submit_btn.config(text="+ Add Record", bg=ACCENT)
+
+    def _sort_by(self, col):
+        """Sort Treeview rows by the clicked column header."""
+        data = [(self._tree.set(k, col), k) for k in self._tree.get_children("")]
+        try:
+            data.sort(key=lambda x: float(x[0]))
+        except ValueError:
+            data.sort(key=lambda x: x[0].lower())
+        for i, (_, k) in enumerate(data):
+            self._tree.move(k, "", i)
 
 
 if __name__ == "__main__":
-    app = HeatwaveApp()
+    app = HeatwaveDashboard()
     app.mainloop()
